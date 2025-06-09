@@ -1,6 +1,12 @@
 # Archivos de configuración con información sensible
 synthetic_data_generator/config.py
 
+
+# Evita subir configuraciones con claves
+*.old
+config.py
+*.env
+
 # Archivos de Python
 __pycache__/
 *.py[cod]
