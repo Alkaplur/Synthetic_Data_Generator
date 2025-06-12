@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 # Imports del paquete openai-agents instalado
 from agents import Runner, Agent
+from openai.types.responses import ResponseTextDeltaEvent
 
 # Import de tu archivo local renombrado  
 from my_agents import AGENTS, orchestrator_agent
@@ -47,16 +48,11 @@ async def handle_message(
         # Ejecutar el mensaje
         result = await Runner.run(agent, input=message, context=agent_context)
 
-        # Cambios de agente (handoff) - versión corregida para openai-agents
-        max_handoffs = 3  # Evitar loops infinitos
-        handoff_count = 0
-
-        # En openai-agents, los handoffs se manejan automáticamente por el Runner
-        # Solo necesitamos actualizar el agente actual si hay un cambio
+        # En openai-agents, los handoffs se manejan automáticamente
+        # Solo actualizamos el agente actual
         if hasattr(result, 'last_agent') and result.last_agent:
             synthetic_context.current_agent = result.last_agent.name
         else:
-            # Mantener el agente actual si no hay cambios
             synthetic_context.current_agent = agent.name
 
         return {
@@ -85,11 +81,13 @@ async def handle_message_stream(
     context_store: Dict[str, SyntheticDataContext]
 ) -> AsyncGenerator[StreamEvent, None]:
     try:
+        # Contexto propio del sistema
         if session_id not in context_store:
             context = create_context(user_id, session_id)
             context.current_agent = "Orchestrator"
             context_store[session_id] = context
 
+        # Contexto para el SDK
         if session_id not in AGENT_CONTEXTS:
             AGENT_CONTEXTS[session_id] = {"context": context_store[session_id]}
 
@@ -99,26 +97,76 @@ async def handle_message_stream(
         current_agent_name = synthetic_context.current_agent or "Orchestrator"
         agent = AGENTS.get(current_agent_name, orchestrator_agent)
 
-        # Para streaming, procesar normalmente y simular eventos
-        result = await Runner.run(agent, input=message, context=agent_context)
+        logger.info(f"[{session_id}] Iniciando streaming con agente: {current_agent_name}")
 
-        # Simular eventos de streaming
-        yield StreamEvent(type="message_start", data={"agent": agent.name})
+        # ✨ STREAMING REAL usando openai-agents
+        result = Runner.run_streamed(agent, input=message, context=agent_context)
         
-        # Dividir la respuesta en chunks
-        response = result.final_output
-        chunk_size = 50
-        for i in range(0, len(response), chunk_size):
-            chunk = response[i:i+chunk_size]
-            yield StreamEvent(type="content_block_delta", data={"delta": {"text": chunk}})
-            await asyncio.sleep(0.1)  # Simular delay
-        
-        yield StreamEvent(type="message_done", data={"agent": agent.name})
+        # Enviar evento de inicio
+        yield StreamEvent(
+            type="message_start", 
+            data={"agent": agent.name, "session_id": session_id}
+        )
 
-        # Cambiar el agente si hubo handoff
-        if result.handoff:
-            synthetic_context.current_agent = result.handoff
-            logger.info(f"[{session_id}] Cambio a agente: {result.handoff}")
+        # Stream de eventos en tiempo real
+        async for event in result.stream_events():
+            
+            # 🔥 Eventos de texto (deltas de tokens)
+            if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
+                if event.data.delta:
+                    yield StreamEvent(
+                        type="content_block_delta",
+                        data={"delta": {"text": event.data.delta}}
+                    )
+            
+            # 🤖 Cambios de agente (handoffs)
+            elif event.type == "agent_updated_stream_event":
+                new_agent_name = event.new_agent.name
+                logger.info(f"[{session_id}] Handoff detectado: {current_agent_name} -> {new_agent_name}")
+                
+                yield StreamEvent(
+                    type="agent_change",
+                    data={
+                        "old_agent": current_agent_name,
+                        "new_agent": new_agent_name
+                    }
+                )
+                
+                # Actualizar agente actual
+                synthetic_context.current_agent = new_agent_name
+                current_agent_name = new_agent_name
+
+            # 🛠️ Eventos de herramientas
+            elif event.type == "run_item_stream_event":
+                if event.item.type == "tool_call_item":
+                    yield StreamEvent(
+                        type="tool_call",
+                        data={
+                            "tool_name": event.item.name,
+                            "tool_args": event.item.args
+                        }
+                    )
+                elif event.item.type == "tool_call_output_item":
+                    yield StreamEvent(
+                        type="tool_result",
+                        data={
+                            "tool_output": event.item.output
+                        }
+                    )
+                elif event.item.type == "message_output_item":
+                    logger.info(f"[{session_id}] Mensaje completo generado")
+        
+        # Evento de finalización
+        yield StreamEvent(
+            type="message_done",
+            data={
+                "agent": synthetic_context.current_agent,
+                "final_output": result.final_output,
+                "session_id": session_id
+            }
+        )
+
+        logger.info(f"[{session_id}] Streaming completado. Agente final: {synthetic_context.current_agent}")
 
     except Exception as e:
         logger.error(f"Error en handle_message_stream: {e}", exc_info=True)
