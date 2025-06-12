@@ -1,318 +1,486 @@
 """
-Tools for Synthetic Data Generator - Basic Version
-Herramientas específicas para generación de datos sintéticos
+Tools for Synthetic Data Generator - With SDK Context Management
+Herramientas que usan el contexto del SDK para mantener estado entre llamadas
 """
 
 import os
 import logging
 import pandas as pd
 import uuid
-from typing import Dict, Any, Optional, Callable
-import inspect
-import asyncio
-
-from context import SyntheticDataContext
+import tempfile
+from typing import Dict, Any, Optional
+from dataclasses import dataclass, field
+from agents import function_tool, RunContextWrapper
 
 # Setup logging
 logger = logging.getLogger(__name__)
 
+# ==========================================
+# CONTEXTO PARA EL SDK
+# ==========================================
 
-class Tool:
-    """Representa una herramienta que puede ser llamada por un agente"""
+@dataclass
+class SyntheticDataContext:
+    """
+    Contexto que se pasa al SDK y mantiene estado entre herramientas
+    """
+    user_id: str
+    session_id: str
+    temp_dir: str = field(default_factory=lambda: tempfile.mkdtemp(prefix="synthetic_data_"))
     
-    def __init__(self, func: Callable, name: str = None):
-        self.func = func
-        self.name = name or func.__name__.replace("_tool", "")
-        self.description = func.__doc__ or ""
-        self.signature = inspect.signature(func)
+    # Estado de archivos
+    analyzed_file_path: Optional[str] = None
+    analyzed_file_info: Optional[Dict[str, Any]] = None
+    generated_file_path: Optional[str] = None
+    generated_file_id: Optional[str] = None
+    generated_rows: Optional[int] = None
     
-    async def call(self, context: SyntheticDataContext, **kwargs) -> Dict[str, Any]:
-        """Ejecuta la herramienta con contexto y argumentos"""
-        try:
-            # Bind arguments
-            sig = self.signature
-            bound_args = sig.bind_partial(context, **kwargs)
-            bound_args.apply_defaults()
-            
-            # Call function
-            if asyncio.iscoroutinefunction(self.func):
-                result = await self.func(*bound_args.args, **bound_args.kwargs)
-            else:
-                result = self.func(*bound_args.args, **bound_args.kwargs)
-            
-            return {"success": True, "result": result}
-            
-        except Exception as e:
-            logger.error(f"Error calling tool {self.name}: {str(e)}")
-            return {"success": False, "error": str(e)}
-
-
-def function_tool(func: Callable) -> Tool:
-    """Decorador para convertir una función en Tool"""
-    return Tool(func)
-
+    # Metadatos de proceso
+    last_model_used: Optional[str] = None
+    processing_history: list = field(default_factory=list)
+    current_agent: Optional[str] = None
+    
+    def add_to_history(self, action: str, details: Dict[str, Any]):
+        """Agregar acción al historial"""
+        self.processing_history.append({
+            "timestamp": pd.Timestamp.now().isoformat(),
+            "action": action,
+            "details": details
+        })
 
 # ==========================================
-# HERRAMIENTAS ESPECÍFICAS DEL DOMINIO
+# HERRAMIENTAS CON CONTEXTO DEL SDK
 # ==========================================
 
 @function_tool
-async def load_and_analyze_data_tool(
-    context: SyntheticDataContext,
-    file_path: str
-) -> Dict[str, Any]:
+def analyze_csv_file(wrapper: RunContextWrapper[SyntheticDataContext], file_path: str) -> Dict[str, Any]:
     """
-    Carga y analiza un archivo CSV.
+    Analiza un archivo CSV y guarda la información en el contexto para uso posterior.
     
     Args:
-        context: El contexto de la conversación
-        file_path: Ruta al archivo CSV
+        file_path: Ruta completa al archivo CSV a analizar
         
     Returns:
-        Dict con resultados del análisis
+        Diccionario con estadísticas del archivo CSV
     """
     try:
-        df = pd.read_csv(file_path)
-        context.source_data = df
-        context.source_file_path = file_path
+        # Obtener contexto del SDK
+        context = wrapper.context
         
-        return {
+        # Cargar CSV
+        df = pd.read_csv(file_path)
+        
+        # Análisis completo del archivo
+        analysis = {
+            "success": True,
+            "file_path": file_path,
+            "filename": os.path.basename(file_path),
             "rows": len(df),
             "columns": list(df.columns),
-            "dtypes": {col: str(dtype) for col, dtype in df.dtypes.to_dict().items()},
+            "column_count": len(df.columns),
+            "data_types": {col: str(dtype) for col, dtype in df.dtypes.to_dict().items()},
             "missing_values": df.isnull().sum().to_dict(),
-            "memory_usage": df.memory_usage(deep=True).sum()
+            "missing_percentage": (df.isnull().sum() / len(df) * 100).round(2).to_dict(),
+            "memory_usage_mb": round(df.memory_usage(deep=True).sum() / 1024 / 1024, 2),
+            "numeric_columns": df.select_dtypes(include=['number']).columns.tolist(),
+            "categorical_columns": df.select_dtypes(include=['object']).columns.tolist(),
+            "sample_data": df.head(3).to_dict('records'),
+            "basic_stats": df.describe().to_dict() if len(df.select_dtypes(include=['number']).columns) > 0 else {}
         }
-    except Exception as e:
-        logger.error(f"Error loading file: {str(e)}")
-        raise
-
-
-@function_tool
-async def sdv_generate_tool(
-    context: SyntheticDataContext,
-    num_rows: int
-) -> Dict[str, Any]:
-    """
-    Genera datos sintéticos usando SDV.
-    
-    Args:
-        context: El contexto de la conversación
-        num_rows: Número de filas a generar
         
-    Returns:
-        Dict con resultados de la generación
-    """
-    try:
-        if context.source_data is None:
-            raise ValueError("No hay datos fuente disponibles. Carga un archivo primero.")
-        
-        # Import SDV (lazy loading)
-        try:
-            from sdv.tabular import GaussianCopula
-        except ImportError:
-            raise ImportError("SDV no está instalado. Instala con: pip install sdv")
-        
-        # Train model
-        model = GaussianCopula()
-        model.fit(context.source_data)
-        
-        # Generate data
-        synthetic_data = model.sample(num_rows)
-        
-        # Save to file
-        file_id = str(uuid.uuid4())
-        file_path = os.path.join(context.temp_dir, f"synthetic_{file_id}.csv")
-        synthetic_data.to_csv(file_path, index=False)
-        
-        # Update context
-        context.generated_file_id = file_id
-        context.generated_file_path = file_path
-        context.generated_rows = num_rows
-        
-        return {
-            "file_id": file_id,
-            "rows": num_rows,
+        # 🎯 GUARDAR EN CONTEXTO para uso posterior
+        context.analyzed_file_path = file_path
+        context.analyzed_file_info = analysis
+        context.add_to_history("csv_analyzed", {
             "file_path": file_path,
-            "columns": list(synthetic_data.columns)
-        }
+            "rows": len(df),
+            "columns": len(df.columns)
+        })
         
+        logger.info(f"✅ CSV analizado y guardado en contexto: {os.path.basename(file_path)} - {len(df)} filas, {len(df.columns)} columnas")
+        return analysis
+        
+    except FileNotFoundError:
+        error_msg = f"❌ Archivo no encontrado: {file_path}"
+        logger.error(error_msg)
+        return {"success": False, "error": error_msg}
+    except pd.errors.EmptyDataError:
+        error_msg = "❌ El archivo CSV está vacío"
+        logger.error(error_msg)
+        return {"success": False, "error": error_msg}
+    except pd.errors.ParserError as e:
+        error_msg = f"❌ Error parsing CSV: {str(e)}"
+        logger.error(error_msg)
+        return {"success": False, "error": error_msg}
     except Exception as e:
-        logger.error(f"Error generating data with SDV: {str(e)}")
-        raise
+        error_msg = f"❌ Error inesperado analizando CSV: {str(e)}"
+        logger.error(error_msg)
+        return {"success": False, "error": error_msg}
 
 
 @function_tool
-async def llm_generate_tool(
-    context: SyntheticDataContext,
+def generate_synthetic_data_with_sdv(
+    wrapper: RunContextWrapper[SyntheticDataContext],
     num_rows: int,
-    data_schema: Optional[Dict] = None
+    model_type: str = "GaussianCopula"
 ) -> Dict[str, Any]:
     """
-    Genera datos sintéticos usando LLM (placeholder).
+    Genera datos sintéticos usando SDV. Usa automáticamente el archivo previamente analizado.
     
     Args:
-        context: El contexto de la conversación
-        num_rows: Número de filas a generar
-        data_schema: Esquema de datos opcional
+        num_rows: Número de filas sintéticas a generar
+        model_type: Tipo de modelo SDV (GaussianCopula, CTGAN, CopulaGAN, TVAE)
         
     Returns:
-        Dict con resultados de la generación
+        Diccionario con información del archivo generado
     """
     try:
-        # TODO: Implementar generación real con LLM
-        # Por ahora, generar datos de ejemplo
+        # Obtener contexto del SDK
+        context = wrapper.context
         
-        import random
-        import datetime
-        
-        # Schema por defecto si no se proporciona
-        if not data_schema:
-            data_schema = {
-                "customer_id": "string",
-                "name": "string", 
-                "age": "integer",
-                "email": "email",
-                "purchase_amount": "float",
-                "registration_date": "date"
+        # 🎯 USAR ARCHIVO DEL CONTEXTO
+        if not context.analyzed_file_path:
+            return {
+                "success": False,
+                "error": "❌ Primero debes analizar un archivo CSV usando analyze_csv_file()"
             }
         
-        # Generar datos de ejemplo
-        synthetic_rows = []
-        for i in range(num_rows):
-            row = {}
-            for col, dtype in data_schema.items():
-                if dtype == "string":
-                    row[col] = f"Customer_{i+1}"
-                elif dtype == "email":
-                    row[col] = f"user{i+1}@example.com"
-                elif dtype == "integer":
-                    row[col] = random.randint(18, 80)
-                elif dtype == "float":
-                    row[col] = round(random.uniform(10.0, 1000.0), 2)
-                elif dtype == "date":
-                    start_date = datetime.date(2020, 1, 1)
-                    random_days = random.randint(0, 1000)
-                    row[col] = start_date + datetime.timedelta(days=random_days)
-            synthetic_rows.append(row)
+        source_file_path = context.analyzed_file_path
         
-        # Crear DataFrame
-        synthetic_data = pd.DataFrame(synthetic_rows)
+        # Cargar datos fuente
+        source_df = pd.read_csv(source_file_path)
         
-        # Save to file
-        file_id = str(uuid.uuid4())
-        file_path = os.path.join(context.temp_dir, f"llm_synthetic_{file_id}.csv")
-        synthetic_data.to_csv(file_path, index=False)
+        # Validaciones básicas
+        if len(source_df) < 2:
+            return {
+                "success": False,
+                "error": "❌ Se necesitan al menos 2 filas en los datos fuente para entrenar el modelo"
+            }
         
-        # Update context
-        context.generated_file_id = file_id
-        context.generated_file_path = file_path
-        context.generated_rows = num_rows
+        if num_rows <= 0:
+            return {
+                "success": False,
+                "error": "❌ El número de filas debe ser mayor a 0"
+            }
         
-        return {
-            "file_id": file_id,
-            "rows": num_rows,
-            "file_path": file_path,
-            "columns": list(synthetic_data.columns),
-            "method": "LLM_placeholder"
-        }
+        if num_rows > 100000:
+            return {
+                "success": False,
+                "error": "❌ Máximo 100,000 filas por generación para evitar problemas de memoria"
+            }
         
-    except Exception as e:
-        logger.error(f"Error generating data with LLM: {str(e)}")
-        raise
-
-
-@function_tool
-async def create_download_link_tool(
-    context: SyntheticDataContext
-) -> Dict[str, Any]:
-    """
-    Crea un enlace de descarga para datos generados.
-    
-    Args:
-        context: El contexto de la conversación
-        
-    Returns:
-        Dict con información de descarga
-    """
-    try:
-        if not context.generated_file_id:
-            raise ValueError("No se ha generado ningún archivo aún")
+        # Import SDV basado en el modelo seleccionado (SDV 1.0+)
+        try:
+            from sdv.metadata import SingleTableMetadata
             
-        return {
-            "file_id": context.generated_file_id,
-            "rows": context.generated_rows,
-            "download_url": f"/download/{context.generated_file_id}?session_id={context.session_id}",
-            "file_exists": os.path.exists(context.generated_file_path) if context.generated_file_path else False
+            if model_type == "GaussianCopula":
+                from sdv.single_table import GaussianCopulaSynthesizer as Synthesizer
+            elif model_type == "CTGAN":
+                from sdv.single_table import CTGANSynthesizer as Synthesizer
+            elif model_type == "CopulaGAN":
+                from sdv.single_table import CopulaGANSynthesizer as Synthesizer
+            elif model_type == "TVAE":
+                from sdv.single_table import TVAESynthesizer as Synthesizer
+            else:
+                return {
+                    "success": False,
+                    "error": f"❌ Modelo no soportado: {model_type}. Modelos disponibles: GaussianCopula, CTGAN, CopulaGAN, TVAE"
+                }
+        except ImportError as e:
+            return {
+                "success": False,
+                "error": "❌ SDV no está instalado correctamente. Instala con: pip install sdv"
+            }
+        
+        logger.info(f"🚀 Iniciando entrenamiento {model_type} con {len(source_df)} filas fuente")
+        
+        # Crear metadatos automáticamente (SDV 1.0+ requirement)
+        try:
+            metadata = SingleTableMetadata()
+            metadata.detect_from_dataframe(source_df)
+            logger.info(f"📊 Metadatos detectados: {len(metadata.columns)} columnas")
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"❌ Error creando metadatos: {str(e)}"
+            }
+        
+        # Entrenar modelo SDV con metadatos
+        try:
+            synthesizer = Synthesizer(metadata)
+            synthesizer.fit(source_df)
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"❌ Error entrenando modelo {model_type}: {str(e)}"
+            }
+        
+        logger.info(f"🎯 Generando {num_rows} filas sintéticas...")
+        
+        # Generar datos sintéticos
+        synthetic_data = synthesizer.sample(num_rows)
+        
+        # Crear archivo con nombre descriptivo en directorio de trabajo
+        timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+        source_filename = os.path.splitext(os.path.basename(source_file_path))[0]
+        output_filename = f"{source_filename}_synthetic_data_{model_type.lower()}_{num_rows}rows_{timestamp}.csv"
+        
+        # Guardar en directorio de trabajo actual
+        current_dir = os.getcwd()
+        output_path = os.path.join(current_dir, output_filename)
+        
+        # Guardar archivo CSV
+        synthetic_data.to_csv(output_path, index=False)
+        
+        # Calcular métricas básicas
+        file_size_mb = round(os.path.getsize(output_path) / 1024 / 1024, 2)
+        
+        # 🎯 ACTUALIZAR CONTEXTO
+        context.generated_file_path = output_path
+        context.generated_file_id = timestamp  # Usar timestamp como ID
+        context.generated_rows = num_rows
+        context.last_model_used = model_type
+        context.add_to_history("synthetic_data_generated", {
+            "model_type": model_type,
+            "num_rows": num_rows,
+            "output_filename": output_filename,
+            "file_size_mb": file_size_mb,
+            "saved_to": "current_directory"
+        })
+        
+        result = {
+            "success": True,
+            "file_id": timestamp,
+            "output_filename": output_filename,
+            "output_path": output_path,
+            "saved_in_current_directory": True,
+            "full_path_for_access": output_path,
+            "rows_generated": num_rows,
+            "columns": list(synthetic_data.columns),
+            "model_used": model_type,
+            "source_file": os.path.basename(source_file_path),
+            "source_rows": len(source_df),
+            "file_size_mb": file_size_mb,
+            "sample_synthetic_data": synthetic_data.head(3).to_dict('records'),
+            "generation_summary": f"✅ Generadas {num_rows:,} filas sintéticas usando {model_type} desde {len(source_df):,} filas originales",
+            "access_instructions": f"El archivo se guardó en: {output_path}"
         }
         
+        logger.info(f"✅ Datos sintéticos generados y guardados en contexto: {output_filename} ({file_size_mb}MB)")
+        return result
+        
     except Exception as e:
-        logger.error(f"Error creating download link: {str(e)}")
-        raise
+        error_msg = f"❌ Error generando datos con SDV: {str(e)}"
+        logger.error(error_msg)
+        return {"success": False, "error": error_msg}
 
 
 @function_tool
-async def get_file_info_tool(
-    context: SyntheticDataContext
-) -> Dict[str, Any]:
+def list_sdv_models() -> Dict[str, Any]:
     """
-    Obtiene información sobre archivos generados.
+    Lista los modelos SDV disponibles con sus descripciones y recomendaciones.
     
-    Args:
-        context: El contexto de la conversación
-        
     Returns:
-        Dict con información de archivos
+        Diccionario con información de todos los modelos SDV
+    """
+    models_info = {
+        "success": True,
+        "available_models": {
+            "GaussianCopula": {
+                "name": "GaussianCopula",
+                "description": "Modelo rápido y eficiente basado en cópulas gaussianas",
+                "pros": ["Muy rápido", "Bajo uso de memoria", "Bueno para datos numéricos"],
+                "cons": ["Limitado con datos categóricos complejos", "Asume distribuciones gaussianas"],
+                "best_for": "Datasets con principalmente datos numéricos, cuando necesitas velocidad",
+                "training_time": "Segundos",
+                "quality": "Buena",
+                "recommended_for": ["Prototipos rápidos", "Datos principalmente numéricos", "Datasets pequeños-medianos"]
+            },
+            "CTGAN": {
+                "name": "CTGAN",
+                "description": "Red neuronal generativa adversarial para datos tabulares",
+                "pros": ["Excelente calidad", "Maneja bien datos categóricos", "Muy realista"],
+                "cons": ["Lento", "Consume mucha memoria", "Necesita más datos de entrenamiento"],
+                "best_for": "Máxima calidad con datos complejos y muchas categorías",
+                "training_time": "Minutos a horas",
+                "quality": "Excelente",
+                "recommended_for": ["Datos complejos", "Muchas columnas categóricas", "Cuando la calidad es prioritaria"]
+            },
+            "CopulaGAN": {
+                "name": "CopulaGAN",
+                "description": "Híbrido que combina cópulas con redes neuronales",
+                "pros": ["Balance velocidad/calidad", "Versátil", "Buen rendimiento general"],
+                "cons": ["No es el mejor en ningún aspecto específico"],
+                "best_for": "Caso general cuando quieres balance entre velocidad y calidad",
+                "training_time": "Minutos",
+                "quality": "Muy buena",
+                "recommended_for": ["Uso general", "Datasets mixtos", "Cuando no sabes qué modelo elegir"]
+            },
+            "TVAE": {
+                "name": "TVAE",
+                "description": "Autoencoder variacional tabular",
+                "pros": ["Excelente con valores faltantes", "Buena calidad", "Robusto"],
+                "cons": ["Más lento que GaussianCopula", "Configuración más compleja"],
+                "best_for": "Datos con muchos valores faltantes o distribuciones complejas",
+                "training_time": "Minutos",
+                "quality": "Muy buena",
+                "recommended_for": ["Datos con valores faltantes", "Distribuciones no gaussianas", "Datos de salud/financieros"]
+            }
+        },
+        "selection_guide": {
+            "fast_prototype": "GaussianCopula",
+            "maximum_quality": "CTGAN", 
+            "balanced_choice": "CopulaGAN",
+            "missing_values": "TVAE",
+            "large_dataset": "GaussianCopula",
+            "small_dataset": "CTGAN o TVAE",
+            "mostly_numeric": "GaussianCopula",
+            "mostly_categorical": "CTGAN",
+            "mixed_data": "CopulaGAN"
+        }
+    }
+    
+    return models_info
+
+
+@function_tool
+def create_download_link(wrapper: RunContextWrapper[SyntheticDataContext]) -> Dict[str, Any]:
+    """
+    Crea un enlace de descarga para el archivo generado previamente.
+    
+    Returns:
+        Información del enlace de descarga
     """
     try:
-        return {
-            "has_source_file": bool(context.source_file_path),
-            "source_file_path": context.source_file_path,
-            "has_generated_file": bool(context.generated_file_id),
-            "generated_file_id": context.generated_file_id,
-            "generated_rows": context.generated_rows,
-            "temp_dir": context.temp_dir,
-            "session_id": context.session_id
+        # Obtener contexto del SDK
+        context = wrapper.context
+        
+        # Verificar que hay archivo generado
+        if not context.generated_file_id or not context.generated_file_path:
+            return {
+                "success": False,
+                "error": "❌ No hay archivos generados disponibles para descargar. Primero genera datos sintéticos."
+            }
+        
+        # Verificar que el archivo existe
+        if not os.path.exists(context.generated_file_path):
+            return {
+                "success": False,
+                "error": "❌ El archivo generado no se encuentra en el sistema"
+            }
+        
+        # Crear información de descarga
+        download_info = {
+            "success": True,
+            "file_id": context.generated_file_id,
+            "download_url": f"/download/{context.generated_file_id}?session_id={context.session_id}",
+            "filename": os.path.basename(context.generated_file_path),
+            "rows": context.generated_rows,
+            "model_used": context.last_model_used,
+            "file_size_mb": round(os.path.getsize(context.generated_file_path) / 1024 / 1024, 2),
+            "created_at": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "full_path": context.generated_file_path
         }
         
+        context.add_to_history("download_link_created", {
+            "file_id": context.generated_file_id,
+            "filename": os.path.basename(context.generated_file_path)
+        })
+        
+        logger.info(f"📥 Enlace de descarga creado para archivo: {context.generated_file_id}")
+        return download_info
+        
     except Exception as e:
-        logger.error(f"Error getting file info: {str(e)}")
-        raise
+        error_msg = f"❌ Error creando enlace de descarga: {str(e)}"
+        logger.error(error_msg)
+        return {"success": False, "error": error_msg}
+
+
+@function_tool
+def get_session_status(wrapper: RunContextWrapper[SyntheticDataContext]) -> Dict[str, Any]:
+    """
+    Obtiene el estado completo de la sesión actual.
+    
+    Returns:
+        Estado completo de la sesión y archivos
+    """
+    try:
+        # Obtener contexto del SDK
+        context = wrapper.context
+        
+        session_status = {
+            "success": True,
+            "session_info": {
+                "session_id": context.session_id,
+                "user_id": context.user_id,
+                "temp_directory": context.temp_dir
+            },
+            "analyzed_file": {
+                "has_file": bool(context.analyzed_file_path),
+                "file_path": context.analyzed_file_path,
+                "file_info": context.analyzed_file_info
+            },
+            "generated_file": {
+                "has_file": bool(context.generated_file_id),
+                "file_id": context.generated_file_id,
+                "file_path": context.generated_file_path,
+                "rows_generated": context.generated_rows,
+                "model_used": context.last_model_used
+            },
+            "processing_history": context.processing_history[-5:] if context.processing_history else [],  # Últimas 5 acciones
+            "total_actions": len(context.processing_history)
+        }
+        
+        return session_status
+        
+    except Exception as e:
+        error_msg = f"❌ Error obteniendo estado de sesión: {str(e)}"
+        logger.error(error_msg)
+        return {"success": False, "error": error_msg}
 
 
 # ==========================================
 # UTILIDADES PARA AGENTES
 # ==========================================
 
-def get_available_tools() -> Dict[str, Tool]:
-    """Retorna todas las herramientas disponibles"""
-    return {
-        "load_and_analyze": load_and_analyze_data_tool,
-        "sdv_generate": sdv_generate_tool,
-        "llm_generate": llm_generate_tool,
-        "create_download": create_download_link_tool,
-        "get_file_info": get_file_info_tool
-    }
-
-
-def get_tools_for_agent(agent_type: str) -> list[Tool]:
-    """Retorna herramientas específicas para un tipo de agente"""
-    all_tools = get_available_tools()
+def get_tools_for_agent(agent_type: str) -> list:
+    """
+    Retorna herramientas específicas para un tipo de agente.
     
+    Args:
+        agent_type: Tipo de agente
+        
+    Returns:
+        Lista de function_tools para el agente
+    """
     if agent_type == "sample_data":
         return [
-            all_tools["load_and_analyze"],
-            all_tools["sdv_generate"],
-            all_tools["create_download"],
-            all_tools["get_file_info"]
+            analyze_csv_file,
+            list_sdv_models,
+            generate_synthetic_data_with_sdv,
+            create_download_link,
+            get_session_status
         ]
     elif agent_type == "pure_synthetic":
         return [
-            all_tools["llm_generate"],
-            all_tools["create_download"],
-            all_tools["get_file_info"]
+            # TODO: Agregar herramientas para generación con LLM/Nemotron
+            get_session_status
         ]
     elif agent_type == "orchestrator":
-        return [all_tools["get_file_info"]]
+        return [
+            get_session_status
+        ]
+    elif agent_type == "pure_historical":
+        return [
+            # TODO: Agregar herramientas para carga de datos históricos
+            get_session_status
+        ]
     else:
-        return list(all_tools.values())
+        # Retornar todas las herramientas disponibles
+        return [
+            analyze_csv_file,
+            list_sdv_models,
+            generate_synthetic_data_with_sdv,
+            create_download_link,
+            get_session_status
+        ]

@@ -10,7 +10,8 @@ from openai.types.responses import ResponseTextDeltaEvent
 # Import de tu archivo local renombrado  
 from my_agents import AGENTS, orchestrator_agent
 
-from context import SyntheticDataContext, create_context
+# Import del contexto del SDK
+from tools import SyntheticDataContext
 
 logger = logging.getLogger(__name__)
 
@@ -19,54 +20,47 @@ class StreamEvent:
     type: str
     data: Any
 
-# Memoria conversacional simple
-AGENT_CONTEXTS: dict[str, Dict[str, Any]] = {}
+# Almacén de contextos por sesión
+SESSION_CONTEXTS: Dict[str, SyntheticDataContext] = {}
 
 async def handle_message(
     message: str,
     user_id: str,
     session_id: str,
-    context_store: Dict[str, SyntheticDataContext]
+    context_store: Dict[str, Any]  # Ya no se usa, mantenido por compatibilidad
 ) -> Dict[str, str]:
     try:
-        # Contexto propio del sistema
-        if session_id not in context_store:
-            context = create_context(user_id, session_id)
-            context.current_agent = "Orchestrator"
-            context_store[session_id] = context
-
-        # Contexto para el SDK
-        if session_id not in AGENT_CONTEXTS:
-            AGENT_CONTEXTS[session_id] = {"context": context_store[session_id]}
-
-        synthetic_context = context_store[session_id]
-        agent_context = AGENT_CONTEXTS[session_id]
-
-        current_agent_name = synthetic_context.current_agent or "Orchestrator"
+        # 🎯 CREAR/OBTENER CONTEXTO DEL SDK
+        if session_id not in SESSION_CONTEXTS:
+            SESSION_CONTEXTS[session_id] = SyntheticDataContext(
+                user_id=user_id,
+                session_id=session_id
+            )
+        
+        sdk_context = SESSION_CONTEXTS[session_id]
+        current_agent_name = getattr(sdk_context, 'current_agent', 'Orchestrator')
         agent = AGENTS.get(current_agent_name, orchestrator_agent)
 
-        # Ejecutar el mensaje
-        result = await Runner.run(agent, input=message, context=agent_context)
+        # Ejecutar el mensaje con contexto del SDK
+        result = await Runner.run(agent, input=message, context=sdk_context)
 
-        # En openai-agents, los handoffs se manejan automáticamente
-        # Solo actualizamos el agente actual
+        # Actualizar agente actual
         if hasattr(result, 'last_agent') and result.last_agent:
-            synthetic_context.current_agent = result.last_agent.name
+            sdk_context.current_agent = result.last_agent.name
         else:
-            synthetic_context.current_agent = agent.name
+            sdk_context.current_agent = agent.name
 
         return {
             "session_id": session_id,
-            "agent": synthetic_context.current_agent,
+            "agent": sdk_context.current_agent,
             "response": result.final_output
         }
 
     except Exception as e:
         logger.error(f"Error en handle_message: {e}", exc_info=True)
-        # Fix para el error de context_store
         current_agent = "unknown"
-        if session_id in context_store and hasattr(context_store[session_id], 'current_agent'):
-            current_agent = context_store[session_id].current_agent or "unknown"
+        if session_id in SESSION_CONTEXTS:
+            current_agent = getattr(SESSION_CONTEXTS[session_id], 'current_agent', 'unknown')
         
         return {
             "session_id": session_id,
@@ -78,29 +72,24 @@ async def handle_message_stream(
     message: str,
     user_id: str,
     session_id: str,
-    context_store: Dict[str, SyntheticDataContext]
+    context_store: Dict[str, Any]  # Ya no se usa, mantenido por compatibilidad
 ) -> AsyncGenerator[StreamEvent, None]:
     try:
-        # Contexto propio del sistema
-        if session_id not in context_store:
-            context = create_context(user_id, session_id)
-            context.current_agent = "Orchestrator"
-            context_store[session_id] = context
-
-        # Contexto para el SDK
-        if session_id not in AGENT_CONTEXTS:
-            AGENT_CONTEXTS[session_id] = {"context": context_store[session_id]}
-
-        synthetic_context = context_store[session_id]
-        agent_context = AGENT_CONTEXTS[session_id]
-
-        current_agent_name = synthetic_context.current_agent or "Orchestrator"
+        # 🎯 CREAR/OBTENER CONTEXTO DEL SDK
+        if session_id not in SESSION_CONTEXTS:
+            SESSION_CONTEXTS[session_id] = SyntheticDataContext(
+                user_id=user_id,
+                session_id=session_id
+            )
+        
+        sdk_context = SESSION_CONTEXTS[session_id]
+        current_agent_name = getattr(sdk_context, 'current_agent', 'Orchestrator')
         agent = AGENTS.get(current_agent_name, orchestrator_agent)
 
         logger.info(f"[{session_id}] Iniciando streaming con agente: {current_agent_name}")
 
-        # ✨ STREAMING REAL usando openai-agents
-        result = Runner.run_streamed(agent, input=message, context=agent_context)
+        # ✨ STREAMING REAL usando openai-agents con contexto del SDK
+        result = Runner.run_streamed(agent, input=message, context=sdk_context)
         
         # Enviar evento de inicio
         yield StreamEvent(
@@ -132,20 +121,41 @@ async def handle_message_stream(
                     }
                 )
                 
-                # Actualizar agente actual
-                synthetic_context.current_agent = new_agent_name
+                # Actualizar agente actual en contexto
+                sdk_context.current_agent = new_agent_name
                 current_agent_name = new_agent_name
 
-            # 🛠️ Eventos de herramientas
+            # 🛠️ Eventos de herramientas (versión mejorada)
             elif event.type == "run_item_stream_event":
                 if event.item.type == "tool_call_item":
+                    # Obtener nombre de herramienta de forma segura
+                    tool_name = "herramienta_desconocida"
+                    tool_args = {}
+                    
+                    # Intentar diferentes formas de obtener el nombre
+                    if hasattr(event.item, 'name'):
+                        tool_name = event.item.name
+                    elif hasattr(event.item, 'function') and hasattr(event.item.function, 'name'):
+                        tool_name = event.item.function.name
+                    elif hasattr(event.item, 'tool_name'):
+                        tool_name = event.item.tool_name
+                    
+                    # Intentar obtener argumentos
+                    if hasattr(event.item, 'args'):
+                        tool_args = event.item.args
+                    elif hasattr(event.item, 'function') and hasattr(event.item.function, 'arguments'):
+                        tool_args = event.item.function.arguments
+                    elif hasattr(event.item, 'arguments'):
+                        tool_args = event.item.arguments
+                    
                     yield StreamEvent(
                         type="tool_call",
                         data={
-                            "tool_name": event.item.name,
-                            "tool_args": event.item.args
+                            "tool_name": tool_name,
+                            "tool_args": tool_args
                         }
                     )
+                    
                 elif event.item.type == "tool_call_output_item":
                     yield StreamEvent(
                         type="tool_result",
@@ -155,18 +165,18 @@ async def handle_message_stream(
                     )
                 elif event.item.type == "message_output_item":
                     logger.info(f"[{session_id}] Mensaje completo generado")
-        
+
         # Evento de finalización
         yield StreamEvent(
             type="message_done",
             data={
-                "agent": synthetic_context.current_agent,
-                "final_output": result.final_output,
+                "agent": sdk_context.current_agent,
+                "final_output": result.final_output if hasattr(result, 'final_output') and result.final_output else "Respuesta completada",
                 "session_id": session_id
             }
         )
 
-        logger.info(f"[{session_id}] Streaming completado. Agente final: {synthetic_context.current_agent}")
+        logger.info(f"[{session_id}] Streaming completado. Agente final: {sdk_context.current_agent}")
 
     except Exception as e:
         logger.error(f"Error en handle_message_stream: {e}", exc_info=True)
