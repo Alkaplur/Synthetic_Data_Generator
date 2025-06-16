@@ -8,7 +8,7 @@ import logging
 import pandas as pd
 import uuid
 import tempfile
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, field
 from agents import function_tool, RunContextWrapper
 
@@ -16,7 +16,7 @@ from agents import function_tool, RunContextWrapper
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# CONTEXTO PARA EL SDK
+# CONTEXTO PARA EL SDK - DEFINICIÓN ÚNICA
 # ==========================================
 
 @dataclass
@@ -27,6 +27,9 @@ class SyntheticDataContext:
     user_id: str
     session_id: str
     temp_dir: str = field(default_factory=lambda: tempfile.mkdtemp(prefix="synthetic_data_"))
+
+    # 🧠 MEMORIA DE CONVERSACIÓN 
+    conversation_messages: list = field(default_factory=list)
     
     # Estado de archivos
     analyzed_file_path: Optional[str] = None
@@ -440,7 +443,7 @@ def get_session_status(wrapper: RunContextWrapper[SyntheticDataContext]) -> Dict
 
 
 # ==========================================
-# UTILIDADES PARA AGENTES
+# UTILIDADES PARA AGENTES - CORREGIDAS
 # ==========================================
 
 def get_tools_for_agent(agent_type: str) -> list:
@@ -463,9 +466,9 @@ def get_tools_for_agent(agent_type: str) -> list:
         ]
     elif agent_type == "pure_synthetic":
         # Import local para evitar circular import
-        from pure_tools_simple import generate_synthetic_data_simple
+        from nvidia_synthetic_generator import generate_synthetic_data_dynamic
         return [
-            generate_synthetic_data_simple,
+            generate_synthetic_data_dynamic,
             get_session_status
         ]
     elif agent_type == "orchestrator":

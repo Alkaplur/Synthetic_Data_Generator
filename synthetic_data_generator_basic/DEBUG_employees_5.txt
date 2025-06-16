@@ -1,6 +1,0 @@
-"id","first_name","last_name","department","position","salary","hire_date"
-"1","Sofía","García López","Marketing","Digital Strategist","52000","2020-08-15"
-"2","Luis","Hernández Díaz","IT","Network Administrator","58000","2018-04-02"
-"3","Valeria","Ramos Morales","Finanzas","Accountant","45000","2022-01-10"
-"4","Alejandro","Sánchez Gómez","Recursos Humanos","HR Generalist","50000","2019-10-28"
-"5","Isabel","Fernández Rodríguez","Ingeniería","Software Engineer","62000","2021-06-07"

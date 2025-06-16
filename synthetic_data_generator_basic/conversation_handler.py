@@ -10,8 +10,8 @@ from openai.types.responses import ResponseTextDeltaEvent
 # Import de tu archivo local renombrado  
 from my_agents import AGENTS, orchestrator_agent
 
-# Import del contexto del SDK
-from tools import SyntheticDataContext
+# Import del contexto del SDK - CORREGIDO
+from sdk_tools_and_context import SyntheticDataContext
 
 logger = logging.getLogger(__name__)
 
@@ -41,14 +41,40 @@ async def handle_message(
         current_agent_name = getattr(sdk_context, 'current_agent', 'Orchestrator')
         agent = AGENTS.get(current_agent_name, orchestrator_agent)
 
-        # Ejecutar el mensaje con contexto del SDK
-        result = await Runner.run(agent, input=message, context=sdk_context)
+        # 🧠 MEMORIA DE CONVERSACIÓN - Inicializar si no existe
+        if not hasattr(sdk_context, 'conversation_messages'):
+            sdk_context.conversation_messages = []
 
+        # 🧠 CONSTRUIR INPUT CON HISTORIAL COMPLETO
+        new_user_message = {"role": "user", "content": message}
+        
+        if sdk_context.conversation_messages:
+            # Usar historial existente + nuevo mensaje
+            full_input = sdk_context.conversation_messages + [new_user_message]
+        else:
+            # Primera interacción
+            full_input = [new_user_message]
+
+        # DEBUG: Ver el contexto antes de ejecutar
+        print(f"🔍 DEBUG Contexto - Session: {sdk_context.session_id}")
+        print(f"🔍 DEBUG Contexto - User: {sdk_context.user_id}")  
+        print(f"🔍 DEBUG Contexto - Current Agent: {sdk_context.current_agent}")
+        print(f"🔍 DEBUG Mensajes en memoria: {len(sdk_context.conversation_messages)}")
+        print(f"🔍 DEBUG Input completo: {len(full_input)} mensajes")
+
+        # 🚀 EJECUTAR CON HISTORIAL COMPLETO
+        result = await Runner.run(agent, input=full_input, context=sdk_context)
+
+        # 🧠 GUARDAR HISTORIAL ACTUALIZADO PARA PRÓXIMA VEZ
+        sdk_context.conversation_messages = result.to_input_list()
+        
         # Actualizar agente actual
         if hasattr(result, 'last_agent') and result.last_agent:
             sdk_context.current_agent = result.last_agent.name
         else:
             sdk_context.current_agent = agent.name
+
+        print(f"🧠 DEBUG Memoria actualizada: {len(sdk_context.conversation_messages)} mensajes guardados")
 
         return {
             "session_id": session_id,
@@ -86,15 +112,35 @@ async def handle_message_stream(
         current_agent_name = getattr(sdk_context, 'current_agent', 'Orchestrator')
         agent = AGENTS.get(current_agent_name, orchestrator_agent)
 
-        logger.info(f"[{session_id}] Iniciando streaming con agente: {current_agent_name}")
+        # 🧠 MEMORIA DE CONVERSACIÓN - Inicializar si no existe
+        if not hasattr(sdk_context, 'conversation_messages'):
+            sdk_context.conversation_messages = []
 
-        # ✨ STREAMING REAL usando openai-agents con contexto del SDK
-        result = Runner.run_streamed(agent, input=message, context=sdk_context)
+        # 🧠 CONSTRUIR INPUT CON HISTORIAL COMPLETO
+        new_user_message = {"role": "user", "content": message}
+        
+        if sdk_context.conversation_messages:
+            # Usar historial existente + nuevo mensaje
+            full_input = sdk_context.conversation_messages + [new_user_message]
+        else:
+            # Primera interacción
+            full_input = [new_user_message]
+
+        logger.info(f"[{session_id}] Iniciando streaming con agente: {current_agent_name}")
+        logger.info(f"[{session_id}] Mensajes en memoria: {len(sdk_context.conversation_messages)}")
+        logger.info(f"[{session_id}] Input total: {len(full_input)} mensajes")
+
+        # ✨ STREAMING REAL usando openai-agents con contexto del SDK + MEMORIA
+        result = Runner.run_streamed(agent, input=full_input, context=sdk_context)
         
         # Enviar evento de inicio
         yield StreamEvent(
             type="message_start", 
-            data={"agent": agent.name, "session_id": session_id}
+            data={
+                "agent": agent.name, 
+                "session_id": session_id,
+                "messages_in_memory": len(sdk_context.conversation_messages)
+            }
         )
 
         # Stream de eventos en tiempo real
@@ -166,17 +212,22 @@ async def handle_message_stream(
                 elif event.item.type == "message_output_item":
                     logger.info(f"[{session_id}] Mensaje completo generado")
 
+        # 🧠 GUARDAR HISTORIAL ACTUALIZADO PARA PRÓXIMA VEZ
+        sdk_context.conversation_messages = result.to_input_list()
+
         # Evento de finalización
         yield StreamEvent(
             type="message_done",
             data={
                 "agent": sdk_context.current_agent,
                 "final_output": result.final_output if hasattr(result, 'final_output') and result.final_output else "Respuesta completada",
-                "session_id": session_id
+                "session_id": session_id,
+                "messages_saved": len(sdk_context.conversation_messages)
             }
         )
 
         logger.info(f"[{session_id}] Streaming completado. Agente final: {sdk_context.current_agent}")
+        logger.info(f"[{session_id}] Memoria actualizada: {len(sdk_context.conversation_messages)} mensajes guardados")
 
     except Exception as e:
         logger.error(f"Error en handle_message_stream: {e}", exc_info=True)
