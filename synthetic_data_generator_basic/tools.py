@@ -462,8 +462,10 @@ def get_tools_for_agent(agent_type: str) -> list:
             get_session_status
         ]
     elif agent_type == "pure_synthetic":
+        # Import local para evitar circular import
+        from pure_tools_simple import generate_synthetic_data_simple
         return [
-            # TODO: Agregar herramientas para generación con LLM/Nemotron
+            generate_synthetic_data_simple,
             get_session_status
         ]
     elif agent_type == "orchestrator":
