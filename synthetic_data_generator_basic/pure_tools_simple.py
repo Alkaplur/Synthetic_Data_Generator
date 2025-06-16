@@ -131,18 +131,25 @@ Output only CSV data, no explanations."""
             print("⚠️ DEBUG: CSV limpio está vacío, usando respuesta cruda")
             clean_csv = response
         
-        # Crear nombre de archivo
+        # Directorio de salida específico
+        output_dir = "/Users/davidnogueras/Desktop/Cursor/Synthetic_Data_Generator/synthetic_data_generator_basic/Sample data"
+
+        # Crear directorio si no existe
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Crear nombre de archivo con ruta completa
         timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{data_type}_synthetic_{num_rows}rows_{timestamp}.csv"
-        
-        # Guardar archivo
-        with open(filename, 'w') as f:
+        full_path = os.path.join(output_dir, filename)
+
+        # Guardar archivo en la carpeta específica
+        with open(full_path, 'w') as f:
             f.write(clean_csv)
-        
-        print(f"📁 DEBUG: Archivo guardado: {filename}")
+
+        print(f"📁 DEBUG: Archivo guardado en: {full_path}")
         
         # Actualizar contexto
-        context.generated_file_path = os.path.abspath(filename)
+        context.generated_file_path = full_path
         context.generated_file_id = timestamp
         context.generated_rows = num_rows
         context.last_model_used = "nvidia/llama-3.1-nemotron-70b-instruct"
@@ -152,7 +159,7 @@ Output only CSV data, no explanations."""
             "filename": filename,
             "rows_generated": num_rows,
             "data_type": data_type,
-            "file_path": os.path.abspath(filename),
+            "file_path": full_path,
             "message": f"✅ Generados {num_rows} registros de {data_type} usando Nemotron 70B"
         }
         

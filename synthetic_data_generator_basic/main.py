@@ -8,10 +8,6 @@ import uuid
 import os
 import sys
 from conversation_handler import handle_message, handle_message_stream
-from context import create_context
-
-# Almacenamiento en memoria de contextos por sesión
-context_store = {}
 
 async def cli_loop():
     print("🧠 Generador de Datos Sintéticos (Modo CLI con Streaming)")
@@ -48,7 +44,7 @@ async def cli_loop():
                 message=user_input,
                 user_id=user_id,
                 session_id=session_id,
-                context_store=context_store
+                context_store={}
             ):
                 if event.type == "message_start":
                     current_agent = event.data.get("agent", "unknown")
@@ -119,7 +115,7 @@ async def cli_loop_no_streaming():
                 message=user_input,
                 user_id=user_id,
                 session_id=session_id,
-                context_store=context_store
+                context_store={}
             )
 
             print(f"\n🤖 {result['agent']}: {result['response']}")
