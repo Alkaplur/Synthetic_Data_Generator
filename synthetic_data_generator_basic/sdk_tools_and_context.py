@@ -6,7 +6,7 @@ Herramientas que usan el contexto del SDK para mantener estado entre llamadas
 import os
 import logging
 import pandas as pd
-import uuid
+from pathlib import Path
 import tempfile
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, field
@@ -18,6 +18,9 @@ logger = logging.getLogger(__name__)
 # ==========================================
 # CONTEXTO PARA EL SDK - DEFINICIÓN ÚNICA
 # ==========================================
+# Directorio base del proyecto  
+BASE_DIR = Path(__file__).parent
+OUTPUT_DIR = BASE_DIR / "Synthetic data generated"
 
 @dataclass
 class SyntheticDataContext:
@@ -172,10 +175,8 @@ def generate_synthetic_data_with_sdv(
                 "error": "❌ Máximo 100,000 filas por generación para evitar problemas de memoria"
             }
         
-        # Import SDV basado en el modelo seleccionado (SDV 1.0+)
+        # Import SDV basado en el modelo seleccionado (SDV 1.21+)
         try:
-            from sdv.metadata import SingleTableMetadata
-            
             if model_type == "GaussianCopula":
                 from sdv.single_table import GaussianCopulaSynthesizer as Synthesizer
             elif model_type == "CTGAN":
@@ -194,25 +195,42 @@ def generate_synthetic_data_with_sdv(
                 "success": False,
                 "error": "❌ SDV no está instalado correctamente. Instala con: pip install sdv"
             }
-        
+
         logger.info(f"🚀 Iniciando entrenamiento {model_type} con {len(source_df)} filas fuente")
-        
-        # Crear metadatos automáticamente (SDV 1.0+ requirement)
+
+        # Crear metadatos para SDV 1.21+ (algunos modelos los requieren)
         try:
+            from sdv.metadata import SingleTableMetadata
             metadata = SingleTableMetadata()
             metadata.detect_from_dataframe(source_df)
             logger.info(f"📊 Metadatos detectados: {len(metadata.columns)} columnas")
         except Exception as e:
+            logger.error(f"Error creando metadatos: {str(e)}")
             return {
                 "success": False,
                 "error": f"❌ Error creando metadatos: {str(e)}"
             }
-        
-        # Entrenar modelo SDV con metadatos
+
+        # Crear synthesizer con manejo específico por modelo
         try:
-            synthesizer = Synthesizer(metadata)
+            if model_type == "GaussianCopula":
+                # GaussianCopula puede funcionar sin metadatos
+                try:
+                    synthesizer = Synthesizer()
+                except:
+                    synthesizer = Synthesizer(metadata)
+            else:
+                # CTGAN, CopulaGAN, TVAE requieren metadatos
+                synthesizer = Synthesizer(metadata)
+            
+            logger.info(f"✅ Synthesizer {model_type} creado exitosamente")
+            
+            # Entrenar modelo
             synthesizer.fit(source_df)
+            logger.info(f"✅ Modelo {model_type} entrenado exitosamente")
+            
         except Exception as e:
+            logger.error(f"Error entrenando modelo {model_type}: {str(e)}")
             return {
                 "success": False,
                 "error": f"❌ Error entrenando modelo {model_type}: {str(e)}"
@@ -221,16 +239,25 @@ def generate_synthetic_data_with_sdv(
         logger.info(f"🎯 Generando {num_rows} filas sintéticas...")
         
         # Generar datos sintéticos
-        synthetic_data = synthesizer.sample(num_rows)
+        try:
+            synthetic_data = synthesizer.sample(num_rows)
+            logger.info(f"✅ {num_rows} filas sintéticas generadas exitosamente")
+        except Exception as e:
+            logger.error(f"Error generando datos: {str(e)}")
+            return {
+                "success": False,
+                "error": f"❌ Error generando {num_rows} filas: {str(e)}"
+            }
         
         # Crear archivo con nombre descriptivo en directorio de trabajo
         timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
         source_filename = os.path.splitext(os.path.basename(source_file_path))[0]
         output_filename = f"{source_filename}_synthetic_data_{model_type.lower()}_{num_rows}rows_{timestamp}.csv"
         
-        # Guardar en directorio de trabajo actual
-        current_dir = os.getcwd()
-        output_path = os.path.join(current_dir, output_filename)
+        # Guardar en directorio específico para datos sintéticos
+        output_dir = "/Users/davidnogueras/Desktop/Cursor/Synthetic_Data_Generator/synthetic_data_generator_basic/Synthetic data generated"
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, output_filename)
         
         # Guardar archivo CSV
         synthetic_data.to_csv(output_path, index=False)
@@ -240,7 +267,7 @@ def generate_synthetic_data_with_sdv(
         
         # 🎯 ACTUALIZAR CONTEXTO
         context.generated_file_path = output_path
-        context.generated_file_id = timestamp  # Usar timestamp como ID
+        context.generated_file_id = timestamp
         context.generated_rows = num_rows
         context.last_model_used = model_type
         context.add_to_history("synthetic_data_generated", {
@@ -248,7 +275,7 @@ def generate_synthetic_data_with_sdv(
             "num_rows": num_rows,
             "output_filename": output_filename,
             "file_size_mb": file_size_mb,
-            "saved_to": "current_directory"
+            "saved_to": "synthetic_data_generated_directory"
         })
         
         result = {
@@ -256,7 +283,7 @@ def generate_synthetic_data_with_sdv(
             "file_id": timestamp,
             "output_filename": output_filename,
             "output_path": output_path,
-            "saved_in_current_directory": True,
+            "saved_in_specific_directory": True,
             "full_path_for_access": output_path,
             "rows_generated": num_rows,
             "columns": list(synthetic_data.columns),
@@ -276,128 +303,7 @@ def generate_synthetic_data_with_sdv(
         error_msg = f"❌ Error generando datos con SDV: {str(e)}"
         logger.error(error_msg)
         return {"success": False, "error": error_msg}
-
-
-@function_tool
-def list_sdv_models() -> Dict[str, Any]:
-    """
-    Lista los modelos SDV disponibles con sus descripciones y recomendaciones.
     
-    Returns:
-        Diccionario con información de todos los modelos SDV
-    """
-    models_info = {
-        "success": True,
-        "available_models": {
-            "GaussianCopula": {
-                "name": "GaussianCopula",
-                "description": "Modelo rápido y eficiente basado en cópulas gaussianas",
-                "pros": ["Muy rápido", "Bajo uso de memoria", "Bueno para datos numéricos"],
-                "cons": ["Limitado con datos categóricos complejos", "Asume distribuciones gaussianas"],
-                "best_for": "Datasets con principalmente datos numéricos, cuando necesitas velocidad",
-                "training_time": "Segundos",
-                "quality": "Buena",
-                "recommended_for": ["Prototipos rápidos", "Datos principalmente numéricos", "Datasets pequeños-medianos"]
-            },
-            "CTGAN": {
-                "name": "CTGAN",
-                "description": "Red neuronal generativa adversarial para datos tabulares",
-                "pros": ["Excelente calidad", "Maneja bien datos categóricos", "Muy realista"],
-                "cons": ["Lento", "Consume mucha memoria", "Necesita más datos de entrenamiento"],
-                "best_for": "Máxima calidad con datos complejos y muchas categorías",
-                "training_time": "Minutos a horas",
-                "quality": "Excelente",
-                "recommended_for": ["Datos complejos", "Muchas columnas categóricas", "Cuando la calidad es prioritaria"]
-            },
-            "CopulaGAN": {
-                "name": "CopulaGAN",
-                "description": "Híbrido que combina cópulas con redes neuronales",
-                "pros": ["Balance velocidad/calidad", "Versátil", "Buen rendimiento general"],
-                "cons": ["No es el mejor en ningún aspecto específico"],
-                "best_for": "Caso general cuando quieres balance entre velocidad y calidad",
-                "training_time": "Minutos",
-                "quality": "Muy buena",
-                "recommended_for": ["Uso general", "Datasets mixtos", "Cuando no sabes qué modelo elegir"]
-            },
-            "TVAE": {
-                "name": "TVAE",
-                "description": "Autoencoder variacional tabular",
-                "pros": ["Excelente con valores faltantes", "Buena calidad", "Robusto"],
-                "cons": ["Más lento que GaussianCopula", "Configuración más compleja"],
-                "best_for": "Datos con muchos valores faltantes o distribuciones complejas",
-                "training_time": "Minutos",
-                "quality": "Muy buena",
-                "recommended_for": ["Datos con valores faltantes", "Distribuciones no gaussianas", "Datos de salud/financieros"]
-            }
-        },
-        "selection_guide": {
-            "fast_prototype": "GaussianCopula",
-            "maximum_quality": "CTGAN", 
-            "balanced_choice": "CopulaGAN",
-            "missing_values": "TVAE",
-            "large_dataset": "GaussianCopula",
-            "small_dataset": "CTGAN o TVAE",
-            "mostly_numeric": "GaussianCopula",
-            "mostly_categorical": "CTGAN",
-            "mixed_data": "CopulaGAN"
-        }
-    }
-    
-    return models_info
-
-
-@function_tool
-def create_download_link(wrapper: RunContextWrapper[SyntheticDataContext]) -> Dict[str, Any]:
-    """
-    Crea un enlace de descarga para el archivo generado previamente.
-    
-    Returns:
-        Información del enlace de descarga
-    """
-    try:
-        # Obtener contexto del SDK
-        context = wrapper.context
-        
-        # Verificar que hay archivo generado
-        if not context.generated_file_id or not context.generated_file_path:
-            return {
-                "success": False,
-                "error": "❌ No hay archivos generados disponibles para descargar. Primero genera datos sintéticos."
-            }
-        
-        # Verificar que el archivo existe
-        if not os.path.exists(context.generated_file_path):
-            return {
-                "success": False,
-                "error": "❌ El archivo generado no se encuentra en el sistema"
-            }
-        
-        # Crear información de descarga
-        download_info = {
-            "success": True,
-            "file_id": context.generated_file_id,
-            "download_url": f"/download/{context.generated_file_id}?session_id={context.session_id}",
-            "filename": os.path.basename(context.generated_file_path),
-            "rows": context.generated_rows,
-            "model_used": context.last_model_used,
-            "file_size_mb": round(os.path.getsize(context.generated_file_path) / 1024 / 1024, 2),
-            "created_at": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "full_path": context.generated_file_path
-        }
-        
-        context.add_to_history("download_link_created", {
-            "file_id": context.generated_file_id,
-            "filename": os.path.basename(context.generated_file_path)
-        })
-        
-        logger.info(f"📥 Enlace de descarga creado para archivo: {context.generated_file_id}")
-        return download_info
-        
-    except Exception as e:
-        error_msg = f"❌ Error creando enlace de descarga: {str(e)}"
-        logger.error(error_msg)
-        return {"success": False, "error": error_msg}
-
 
 @function_tool
 def get_session_status(wrapper: RunContextWrapper[SyntheticDataContext]) -> Dict[str, Any]:
@@ -459,9 +365,7 @@ def get_tools_for_agent(agent_type: str) -> list:
     if agent_type == "sample_data":
         return [
             analyze_csv_file,
-            list_sdv_models,
             generate_synthetic_data_with_sdv,
-            create_download_link,
             get_session_status
         ]
     elif agent_type == "pure_synthetic":

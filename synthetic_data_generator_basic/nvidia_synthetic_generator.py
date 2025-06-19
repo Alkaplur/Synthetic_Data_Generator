@@ -6,8 +6,13 @@ import os
 import pandas as pd
 import openai
 from typing import Dict, Any
-
+from pathlib import Path
 from agents import function_tool, RunContextWrapper
+from sdk_tools_and_context import SyntheticDataContext
+
+# Directorio base del proyecto
+BASE_DIR = Path(__file__).parent
+OUTPUT_DIR = BASE_DIR / "Synthetic data generated"
 
 # Configurar cliente NVIDIA
 nvidia_client = openai.OpenAI(
@@ -55,7 +60,7 @@ def clean_csv_response(response: str) -> str:
 
 @function_tool
 def generate_synthetic_data_dynamic(
-    wrapper: RunContextWrapper,  # CORREGIDO: Sin especificar tipo para evitar circular import
+    wrapper: RunContextWrapper[SyntheticDataContext],
     description: str,
     num_rows: int,
     country: str = "Spain"
@@ -134,7 +139,7 @@ Data: (generate {num_rows} rows)"""
             clean_csv = response
         
         # Directorio de salida específico
-        output_dir = "/Users/davidnogueras/Desktop/Cursor/Synthetic_Data_Generator/synthetic_data_generator_basic/Sample data"
+        output_dir = str(OUTPUT_DIR)
         os.makedirs(output_dir, exist_ok=True)
         
         # Crear nombre de archivo descriptivo
@@ -149,15 +154,11 @@ Data: (generate {num_rows} rows)"""
         with open(full_path, 'w', encoding='utf-8') as f:
             f.write(clean_csv)
         
-        # Actualizar contexto - Acceso seguro a atributos
-        if hasattr(context, 'generated_file_path'):
-            context.generated_file_path = full_path
-        if hasattr(context, 'generated_file_id'):
-            context.generated_file_id = timestamp
-        if hasattr(context, 'generated_rows'):
-            context.generated_rows = num_rows
-        if hasattr(context, 'last_model_used'):
-            context.last_model_used = "nvidia/llama-3.1-nemotron-70b-instruct"
+        # Actualizar contexto
+        context.generated_file_path = full_path
+        context.generated_file_id = timestamp
+        context.generated_rows = num_rows
+        context.last_model_used = "nvidia/llama-3.1-nemotron-70b-instruct"
         
         # Extraer info del CSV generado
         lines = clean_csv.split('\n')
@@ -180,26 +181,3 @@ Data: (generate {num_rows} rows)"""
             "success": False,
             "error": f"Error generando datos: {str(e)}"
         }
-
-# Mantener la función antigua por compatibilidad, pero que use la nueva
-@function_tool  
-def generate_synthetic_data_simple(
-    wrapper: RunContextWrapper,
-    data_type: str,
-    num_rows: int
-) -> Dict[str, Any]:
-    """
-    Función de compatibilidad que mapea los tipos fijos a descripciones dinámicas
-    """
-    # Mapear tipos antiguos a descripciones más ricas
-    type_descriptions = {
-        "customers": "clientes de e-commerce con datos personales y de compra",
-        "products": "productos de tienda online con precios y categorías",
-        "employees": "empleados de empresa con departamentos y salarios",
-        "transactions": "transacciones de ventas con fechas y montos",
-        "insurance": "pólizas de seguros con coberturas y riesgos"
-    }
-    
-    description = type_descriptions.get(data_type, data_type)
-    
-    return generate_synthetic_data_dynamic(wrapper, description, num_rows)
